@@ -1,0 +1,116 @@
+---
+- name: Remove local wg0 and remote MikroTik peer
+  hosts: localhost
+  gather_facts: no
+
+  vars_prompt:
+    - name: mikrotik_host
+      prompt: "MikroTik SSH host (e.g. c2sr.duckdns.org or IP)"
+      private: no
+      default: "c2sr.duckdns.org"
+    - name: mikrotik_port
+      prompt: "MikroTik SSH port"
+      private: no
+      default: "3022"
+    - name: mikrotik_user
+      prompt: "MikroTik SSH username"
+      private: no
+      default: "admin"
+    - name: mikrotik_password
+      prompt: "MikroTik SSH password"
+      private: yes
+    - name: wg_conf_path
+      prompt: "Path to local wg0.conf"
+      private: no
+      default: "/etc/wireguard/wg0.conf"
+
+  vars:
+    ssh_base_cmd: >-
+      sshpass -p '{{ mikrotik_password }}' ssh -o StrictHostKeyChecking=no
+      -o PreferredAuthentications=password -o PubkeyAuthentication=no
+      -o HostKeyAlgorithms=+ssh-rsa
+      -p {{ mikrotik_port }} {{ mikrotik_user }}@{{ mikrotik_host }}
+
+  tasks:
+    - name: Check that sshpass is available
+      command: which sshpass
+      register: sshpass_check
+      changed_when: false
+      failed_when: sshpass_check.rc != 0
+
+    - name: Determine interface name from config path
+      set_fact:
+        wg_interface_local: "{{ (wg_conf_path | basename) | regex_replace('\\.conf$', '') }}"
+
+    - name: Check if wg config exists
+      become: yes
+      stat:
+        path: "{{ wg_conf_path }}"
+      register: wg_conf_stat
+
+
+    - name: Extract Address from config (fallback-safe)
+      become: yes
+      shell: "grep -m1 '^[[:space:]]*Address[[:space:]]*=' {{ wg_conf_path }} | head -n1 | cut -d '=' -f2- | tr -d ' \t\r\n'"
+      args:
+        executable: /bin/bash
+      register: addr_cmd
+      changed_when: false
+      failed_when: false
+      when: wg_conf_stat.stat.exists
+
+    - name: Determine remote removal selectors
+      set_fact:
+        remote_allowed: "{{ (addr_cmd.stdout | default('') | trim) if (addr_cmd is defined) and ((addr_cmd.stdout | default('') | trim) | length > 0) else '' }}"
+
+    - name: Prompt for selector if none derived
+      pause:
+        prompt: "Enter allowed-address (e.g. 10.8.0.2[/32]) (leave blank to skip remote removal):"
+        echo: yes
+      register: removal_selector
+      when:
+        - (remote_allowed | default('') | length) == 0
+
+    - name: Apply entered selector
+      set_fact:
+        remote_allowed: "{{ (removal_selector.user_input | default('') | trim) if (removal_selector is defined) and (removal_selector.user_input | default('') | trim | length > 0) else (remote_allowed | default('')) }}"
+      when: removal_selector is defined
+
+    - name: Test MikroTik connectivity (non-fatal)
+      command: >
+        {{ ssh_base_cmd }} '/system/identity/print without-paging'
+      register: mt_test
+      changed_when: false
+      failed_when: false
+
+    - name: Remove peer on MikroTik by allowed-address (if reachable and no pubkey)
+      command: >
+        {{ ssh_base_cmd }} "/interface/wireguard/peers/remove [find where allowed-address=\"{{ '/' in remote_allowed and remote_allowed or (remote_allowed + '/32') }}\"]"
+      register: mt_remove_addr
+      when:
+        - (mt_test.rc | default(1)) == 0
+        - remote_allowed is defined
+        - (remote_allowed | default('') | length) > 0
+      changed_when: true
+
+    - name: Bring down local interface
+      become: yes
+      command: wg-quick down {{ wg_interface_local }}
+      register: wg_down
+      changed_when: wg_down.rc == 0
+      failed_when: false
+
+    - name: Remove local wg config file
+      become: yes
+      file:
+        path: "{{ wg_conf_path }}"
+        state: absent
+
+    - name: Show removal summary
+      debug:
+        msg:
+          - "Server reachable: {{ (mt_test.rc | default(1)) == 0 }}"
+          - "Remote peer removed: {{ ((mt_remove_addr is defined) and (mt_remove_addr.rc | default(1)) == 0) }}"
+          - "Tried by allowed: {{ remote_allowed | default('') }}"
+          - "Local interface down rc: {{ wg_down.rc | default('n/a') }}"
+          - "Local config removed: {{ wg_conf_path }}"

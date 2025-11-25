@@ -1,0 +1,174 @@
+---
+- name: Add a WireGuard peer on MikroTik and generate local wg0.conf
+  hosts: localhost
+  gather_facts: no
+
+  vars_prompt:
+    - name: mikrotik_host
+      prompt: "MikroTik SSH host (e.g. c2sr.duckdns.org)"
+      default: "c2sr.duckdns.org"
+      private: no
+    - name: mikrotik_port
+      prompt: "MikroTik SSH port (e.g. 195)"
+      private: no
+      default: "3022"
+    - name: mikrotik_user
+      prompt: "MikroTik SSH username"
+      private: no
+      default: "admin"
+    - name: mikrotik_password
+      prompt: "MikroTik SSH password"
+      private: yes
+
+  vars:
+    wg_interface: "wireguard1"
+    wg_subnet_base: "10.8.0"
+    wg_conf_path: "/etc/wireguard/wg0.conf"
+
+  tasks:
+    - name: Check that sshpass is available
+      command: which sshpass
+      register: sshpass_check
+      changed_when: false
+      failed_when: sshpass_check.rc != 0
+
+    - name: Get WireGuard interface info (for server public key)
+      command: >
+        sshpass -p '{{ mikrotik_password }}'
+        ssh -o StrictHostKeyChecking=no 
+        -o PreferredAuthentications=password -o PubkeyAuthentication=no 
+        -o HostKeyAlgorithms=+ssh-rsa 
+        -p {{ mikrotik_port }}
+        {{ mikrotik_user }}@{{ mikrotik_host }}
+        "/interface/wireguard/print detail without-paging"
+      register: wg_iface_info
+      changed_when: false
+
+    - name: Extract WireGuard server public key
+      set_fact:
+        wg_server_public_key: "{{ (wg_iface_info.stdout | regex_findall('public-key=\"([^\"]+)\"') | first) | default('') }}"
+
+    - name: Detect WireGuard interface name from device
+      set_fact:
+        wg_interface_detected: "{{ (wg_iface_info.stdout | regex_findall('name=\"([^\"]+)\"') | first) | default('') }}"
+
+    - name: Choose WireGuard interface (detected or default)
+      set_fact:
+        wg_interface_chosen: "{{ (wg_interface_detected | default('')) | trim | default(wg_interface) }}"
+
+    - name: Get existing WireGuard peers
+      command: >
+        sshpass -p '{{ mikrotik_password }}'
+        ssh -o StrictHostKeyChecking=no 
+        -o PreferredAuthentications=password -o PubkeyAuthentication=no 
+        -o HostKeyAlgorithms=+ssh-rsa 
+        -p {{ mikrotik_port }}
+        {{ mikrotik_user }}@{{ mikrotik_host }}
+        "/interface/wireguard/peers/print detail without-paging"
+      register: wg_peers
+      changed_when: false
+
+    - name: Extract used WireGuard IPs (10.8.0.x/32)
+      set_fact:
+        used_wg_ips: "{{ (wg_peers.stdout | default('')) | regex_findall('allowed-address=(10\\.8\\.0\\.\\d+)/32') | default([]) }}"
+
+    - name: Compute next available host number in 10.8.0.0/24
+      set_fact:
+        next_wg_host: >-
+          {{ (range(2, 255) |
+              difference(
+                used_wg_ips
+                | map('regex_replace', '^10\\.8\\.0\\.', '')
+                | map('int')
+              )) | first | default(2) }}
+
+    - name: Build next WireGuard IP address
+      set_fact:
+        next_wg_ip: "{{ wg_subnet_base }}.{{ next_wg_host }}"
+
+    - name: Generate client private key
+      command: wg genkey
+      register: wg_client_priv
+      changed_when: true
+
+    - name: Generate client public key
+      shell: 'echo "{{ wg_client_priv.stdout }}" | wg pubkey'
+      register: wg_client_pub
+      changed_when: true
+
+    - name: Add peer on MikroTik
+      command: >
+        sshpass -p '{{ mikrotik_password }}'
+        ssh -o StrictHostKeyChecking=no 
+        -o PreferredAuthentications=password -o PubkeyAuthentication=no 
+        -o HostKeyAlgorithms=+ssh-rsa 
+        -p {{ mikrotik_port }}
+        {{ mikrotik_user }}@{{ mikrotik_host }}
+        "/interface/wireguard/peers/add interface={{ wg_interface_chosen }} public-key=\"{{ wg_client_pub.stdout | trim }}\" allowed-address={{ next_wg_ip }}/32"
+      register: add_peer_cmd
+      changed_when: true
+
+    - name: Ensure WireGuard config directory exists
+      become: yes
+      file:
+        path: "{{ wg_conf_path | dirname }}"
+        state: directory
+        mode: '0700'
+
+    - name: Write local wg0.conf
+      become: yes
+      copy:
+        dest: "{{ wg_conf_path }}"
+        mode: '0600'
+        content: |
+          [Interface]
+          Address = {{ next_wg_ip }}/32
+          PrivateKey = {{ wg_client_priv.stdout | trim }}
+          DNS = 8.8.8.8
+
+          [Peer]
+          PublicKey = {{ wg_server_public_key }}
+          Endpoint = {{ mikrotik_host }}:51820
+          AllowedIPs = 10.8.0.0/24, 192.168.50.0/24
+          PersistentKeepalive = 25
+
+    - name: Bring up wg0 interface
+      become: yes
+      command: wg-quick up wg0
+      register: wg_up
+      changed_when: wg_up.rc == 0
+      failed_when: false
+
+    - name: Show wg status
+      become: yes
+      command: wg show wg0
+      register: wg_show
+      changed_when: false
+      failed_when: false
+
+    - name: Check route to WG server IP
+      command: ip route get {{ wg_subnet_base }}.1
+      register: route_check
+      changed_when: false
+      failed_when: false
+
+    - name: Ping WG server once (non-fatal)
+      command: ping -c 1 {{ wg_subnet_base }}.1
+      register: ping_check
+      changed_when: false
+      failed_when: false
+
+    - name: WG bring-up summary
+      debug:
+        msg:
+          - "wg up rc: {{ wg_up.rc | default('n/a') }}"
+          - "route uses wg0: {{ (route_check.stdout | default('')) is search(' dev wg0') }}"
+          - "ping rc: {{ ping_check.rc | default('n/a') }}"
+
+    - name: Show summary
+      debug:
+        msg:
+          - "New WireGuard peer added on MikroTik."
+          - "Assigned IP: {{ next_wg_ip }}/32"
+          - "Local config written to: {{ wg_conf_path }}"
+          - "Bring it up with: sudo wg-quick up wg0"
