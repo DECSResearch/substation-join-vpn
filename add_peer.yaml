@@ -72,15 +72,41 @@
       set_fact:
         used_wg_ips: "{{ (wg_peers.stdout | default('')) | regex_findall('allowed-address=(10\\.8\\.0\\.\\d+)/32') | default([]) }}"
 
-    - name: Compute next available host number in 10.8.0.0/24
+    - name: Show used IPs on router
+      debug:
+        msg:
+          - "Used IPs: {{ used_wg_ips | sort }}"
+
+    - name: Enter desired last octet (required)
+      pause:
+        prompt: "Enter REQUIRED last octet for 10.8.0.X (2-254, unused):"
+        echo: yes
+      register: wg_octet_input
+
+    - name: Validate input presence and numeric
+      fail:
+        msg: "You must enter a numeric last octet (2-254)."
+      when: >-
+        (wg_octet_input.user_input | default('') | trim | length == 0) or
+        not ((wg_octet_input.user_input | trim) | regex_search('^\\d+$'))
+
+    - name: Set chosen last octet
       set_fact:
-        next_wg_host: >-
-          {{ (range(2, 255) |
-              difference(
-                used_wg_ips
-                | map('regex_replace', '^10\\.8\\.0\\.', '')
-                | map('int')
-              )) | first | default(2) }}
+        chosen_wg_host: "{{ (wg_octet_input.user_input | trim | int) }}"
+
+    - name: Validate chosen last octet is in range and free
+      fail:
+        msg: >-
+          Invalid choice {{ chosen_wg_host }}. Must be 2-254 and not in use: {{ used_wg_ips | join(', ') }}.
+      when: >-
+        (chosen_wg_host | int < 2) or
+        (chosen_wg_host | int > 254) or
+        (((used_wg_ips | map('regex_replace', '^10\\.8\\.0\\.', '') | map('int') | list) | default([]))
+          is contains (chosen_wg_host | int))
+
+    - name: Use chosen last octet
+      set_fact:
+        next_wg_host: "{{ chosen_wg_host | int }}"
 
     - name: Build next WireGuard IP address
       set_fact:
