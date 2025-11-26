@@ -3,9 +3,11 @@
 Quick, no‑frills steps to add or remove a WireGuard peer on a MikroTik router.
 
 ## Prereqs
-- Linux host with:
-  - `sshpass`, `wireguard-tools` (`wg`, `wg-quick`), and `resolvconf`
-  - Python 3 and `make`
+- Linux host with Python 3 and `make`.
+- One-time system setup (auto via Makefile):
+  - `make bootstrap` (uses `apt`, `dnf`, `yum`, or `pacman` to install python3-venv, sshpass, wireguard-tools, resolvconf)
+  - Or install manually on Ubuntu/Debian: `sudo apt install -y python3-venv sshpass wireguard-tools resolvconf`
+- Python deps are installed into `.venv` automatically when you run the targets.
 
 ## Add a peer
 - Command: `make add_peer`
@@ -32,4 +34,6 @@ Quick, no‑frills steps to add or remove a WireGuard peer on a MikroTik router.
 - If DNS is flaky, use the router’s public IP instead of hostname.
 
 That’s it. Keep it simple: `make add_peer` to add, `make remove_peer` to remove.
-
+## Optional: Prepare Python env only
+- Command: `make setup`
+- Does: runs `make bootstrap` + creates `.venv` and installs Python deps.
